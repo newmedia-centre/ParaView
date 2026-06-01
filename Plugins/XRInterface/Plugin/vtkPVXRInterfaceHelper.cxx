@@ -29,7 +29,9 @@
 #include "pqApplicationCore.h"
 #include "pqCoreUtilities.h"
 #include "pqMainWindowEventManager.h"
+#include "pqObjectBuilder.h"
 #include "pqPipelineSource.h"
+#include "pqProxy.h"
 #include "pqServerManagerModel.h"
 #include "pqXRInterfaceControls.h"
 #include "vtkCallbackCommand.h"
@@ -59,14 +61,18 @@
 #include "vtkRenderViewBase.h"
 #include "vtkRendererCollection.h"
 #include "vtkSMProperty.h"
+#include "vtkSMParaViewPipelineControllerWithRendering.h"
 #include "vtkSMPropertyHelper.h"
+#include "vtkSMProxy.h"
 #include "vtkSMProxyLocator.h"
+#include "vtkSMProxyProperty.h"
 #include "vtkSMRepresentedArrayListDomain.h"
 #include "vtkSMSession.h"
 #include "vtkSMSessionProxyManager.h"
 #include "vtkSMSourceProxy.h"
 #include "vtkSMViewProxy.h"
 #include "vtkShaderProgram.h"
+#include "vtkSmartPointer.h"
 #include "vtkShaderProperty.h"
 #include "vtkStringArray.h"
 #include "vtkStringFormatter.h"
@@ -78,6 +84,7 @@
 #include "vtkVRRay.h"
 #include "vtkVRRenderWindowInteractor.h"
 #include "vtkVRRenderer.h"
+#include "vtkWeakPointer.h"
 #include "vtkVector.h"
 #include "vtkXMLDataElement.h"
 #include "vtkXRInterfacePolyfill.h"
@@ -88,6 +95,60 @@
 #include <chrono>
 #include <sstream>
 #include <thread>
+
+namespace
+{
+bool SetSlicePlane(vtkSMProxy* sliceProxy, vtkSMSessionProxyManager* pxm, const double* origin,
+  const double* normal)
+{
+  if (!sliceProxy || !origin || !normal)
+  {
+    return false;
+  }
+
+  vtkSMProxyProperty* cutFunction =
+    vtkSMProxyProperty::SafeDownCast(sliceProxy->GetProperty("CutFunction"));
+  if (!cutFunction)
+  {
+    return false;
+  }
+
+  vtkSMProxy* planeProxy =
+    cutFunction->GetNumberOfProxies() > 0 ? cutFunction->GetProxy(0) : nullptr;
+  if (!planeProxy && pxm)
+  {
+    vtkSmartPointer<vtkSMProxy> newPlaneProxy;
+    newPlaneProxy.TakeReference(pxm->NewProxy("implicit_functions", "Plane"));
+    if (!newPlaneProxy)
+    {
+      return false;
+    }
+
+    newPlaneProxy->UpdatePropertyInformation();
+    newPlaneProxy->UpdateVTKObjects();
+    if (cutFunction->GetNumberOfProxies() > 0)
+    {
+      cutFunction->SetProxy(0, newPlaneProxy);
+    }
+    else
+    {
+      cutFunction->AddProxy(newPlaneProxy);
+    }
+    planeProxy = newPlaneProxy;
+  }
+
+  if (!planeProxy || !planeProxy->GetProperty("Origin") || !planeProxy->GetProperty("Normal"))
+  {
+    return false;
+  }
+
+  vtkSMPropertyHelper(planeProxy, "Origin").Set(origin, 3);
+  vtkSMPropertyHelper(planeProxy, "Normal").Set(normal, 3);
+  planeProxy->UpdateVTKObjects();
+  cutFunction->UpdateAllInputs();
+  return true;
+}
+}
 
 struct vtkPVXRInterfaceHelper::vtkInternals
 {
@@ -144,6 +205,7 @@ struct vtkPVXRInterfaceHelper::vtkInternals
   QVTKOpenGLWindow* ObserverWidget = nullptr;
   vtkNew<vtkOpenGLCamera> ObserverCamera;
   vtkNew<vtkPVXRInterfaceExporter> Exporter;
+  std::vector<vtkWeakPointer<vtkSMProxy>> CropPlaneSliceProxies;
 
   // To simulate dpad with a trackpad on OpenXR we need to
   // store the last position
@@ -281,7 +343,103 @@ void vtkPVXRInterfaceHelper::collabUpdateThickCrop(int index, double* matrix)
 //----------------------------------------------------------------------------
 void vtkPVXRInterfaceHelper::AddACropPlane(double* origin, double* normal)
 {
+  std::size_t cropPlaneIndex = this->Widgets->GetNumberOfCropPlanes();
   this->Widgets->AddACropPlane(origin, normal);
+
+  // A user-created crop plane starts without an explicit origin/normal. Create
+  // a matching ParaView Slice filter for it so the slice appears as a real
+  // pipeline object in the Pipeline Browser. Restored/collaboration crop
+  // planes pass explicit values and keep the existing transient-widget behavior.
+  if (origin == nullptr && normal == nullptr)
+  {
+    double cropOrigin[3];
+    double cropNormal[3];
+    if (!this->Widgets->GetCropPlaneParameters(cropPlaneIndex, cropOrigin, cropNormal))
+    {
+      return;
+    }
+
+    pqPipelineSource* inputSource = this->XRInterfaceControls
+      ? this->XRInterfaceControls->GetSelectedPipelineSource()
+      : nullptr;
+    if (!inputSource)
+    {
+      inputSource = pqActiveObjects::instance().activeSource();
+    }
+    if (!inputSource)
+    {
+      vtkWarningMacro("Cannot create an XR crop slice without a selected pipeline source.");
+      return;
+    }
+
+    pqObjectBuilder* builder = pqApplicationCore::instance()->getObjectBuilder();
+    pqPipelineSource* sliceSource = builder->createFilter("filters", "Cut", inputSource);
+    if (!sliceSource)
+    {
+      vtkWarningMacro("Failed to create Slice filter for XR crop plane.");
+      return;
+    }
+
+    vtkSMProxy* sliceProxy = sliceSource->getProxy();
+    if (!SetSlicePlane(sliceProxy, inputSource->getServer()->proxyManager(), cropOrigin, cropNormal))
+    {
+      builder->destroy(sliceSource);
+      vtkWarningMacro("Failed to configure Slice filter for XR crop plane.");
+      return;
+    }
+
+    sliceProxy->UpdateVTKObjects();
+    sliceSource->updatePipeline();
+
+    if (this->SMView)
+    {
+      vtkNew<vtkSMParaViewPipelineControllerWithRendering> controller;
+      controller->Show(sliceSource->getSourceProxy(), 0, this->SMView);
+      this->NeedStillRender = true;
+    }
+
+    sliceSource->setModifiedState(pqProxy::UNMODIFIED);
+    if (this->Internals->CropPlaneSliceProxies.size() <= cropPlaneIndex)
+    {
+      this->Internals->CropPlaneSliceProxies.resize(cropPlaneIndex + 1);
+    }
+    this->Internals->CropPlaneSliceProxies[cropPlaneIndex] = sliceProxy;
+    pqActiveObjects::instance().setActiveSource(inputSource);
+  }
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::UpdateCropPlaneSlice(
+  std::size_t index, const double* origin, const double* normal)
+{
+  if (index >= this->Internals->CropPlaneSliceProxies.size())
+  {
+    return;
+  }
+
+  vtkSMProxy* sliceProxy = this->Internals->CropPlaneSliceProxies[index].GetPointer();
+  if (!sliceProxy || !SetSlicePlane(sliceProxy, nullptr, origin, normal))
+  {
+    return;
+  }
+
+  sliceProxy->UpdateVTKObjects();
+
+  pqServerManagerModel* smmodel = pqApplicationCore::instance()->getServerManagerModel();
+  pqPipelineSource* sliceSource = smmodel->findItem<pqPipelineSource*>(sliceProxy);
+  if (sliceSource)
+  {
+    sliceSource->updatePipeline();
+    sliceSource->setModifiedState(pqProxy::UNMODIFIED);
+  }
+
+  this->NeedStillRender = true;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::ClearCropPlaneSliceLinks()
+{
+  this->Internals->CropPlaneSliceProxies.clear();
 }
 
 //----------------------------------------------------------------------------
@@ -2350,6 +2508,7 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
       if (this->SMView && this->NeedStillRender)
       {
         this->SMView->StillRender();
+        this->UpdateProps();
         this->NeedStillRender = false;
       }
       if (this->SMView && this->Internals->LoadLocationValue >= 0)

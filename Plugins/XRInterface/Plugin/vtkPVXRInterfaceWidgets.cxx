@@ -236,6 +236,7 @@ bool vtkPVXRInterfaceWidgets::EventCallback(vtkObject* caller, unsigned long eve
   switch (eventID)
   {
     case vtkCommand::InteractionEvent:
+    case vtkCommand::EndInteractionEvent:
     {
       {
         vtkImplicitPlaneWidget2* widget = vtkImplicitPlaneWidget2::SafeDownCast(caller);
@@ -246,6 +247,16 @@ bool vtkPVXRInterfaceWidgets::EventCallback(vtkObject* caller, unsigned long eve
             if (this->CropPlanes[i] == widget)
             {
               this->Helper->GetCollaborationClient()->UpdateCropPlane(i, this->CropPlanes[i]);
+
+              if (eventID == vtkCommand::EndInteractionEvent)
+              {
+                double origin[3];
+                double normal[3];
+                if (this->GetCropPlaneParameters(i, origin, normal))
+                {
+                  this->Helper->UpdateCropPlaneSlice(i, origin, normal);
+                }
+              }
               return false;
             }
           }
@@ -409,6 +420,26 @@ void vtkPVXRInterfaceWidgets::AddACropPlane(double* origin, double* normal)
 }
 
 //----------------------------------------------------------------------------
+bool vtkPVXRInterfaceWidgets::GetCropPlaneParameters(size_t index, double* origin, double* normal)
+{
+  if (!origin || !normal || index >= this->CropPlanes.size())
+  {
+    return false;
+  }
+
+  vtkImplicitPlaneRepresentation* rep =
+    vtkImplicitPlaneRepresentation::SafeDownCast(this->CropPlanes[index]->GetRepresentation());
+  if (!rep)
+  {
+    return false;
+  }
+
+  rep->GetOrigin(origin);
+  rep->GetNormal(normal);
+  return true;
+}
+
+//----------------------------------------------------------------------------
 void vtkPVXRInterfaceWidgets::collabAddACropPlane(double* origin, double* normal)
 {
   vtkNew<vtkImplicitPlaneRepresentation> rep;
@@ -472,6 +503,7 @@ void vtkPVXRInterfaceWidgets::collabAddACropPlane(double* origin, double* normal
   ps->SetInteractor(renWin->GetInteractor());
   ps->SetEnabled(1);
   ps->AddObserver(vtkCommand::InteractionEvent, this, &vtkPVXRInterfaceWidgets::EventCallback);
+  ps->AddObserver(vtkCommand::EndInteractionEvent, this, &vtkPVXRInterfaceWidgets::EventCallback);
 
   vtkCollectionSimpleIterator pit;
   vtkProp* prop;
@@ -510,6 +542,8 @@ void vtkPVXRInterfaceWidgets::collabAddACropPlane(double* origin, double* normal
 //----------------------------------------------------------------------------
 void vtkPVXRInterfaceWidgets::collabRemoveAllCropPlanes()
 {
+  this->Helper->ClearCropPlaneSliceLinks();
+
   for (vtkImplicitPlaneWidget2* iter : this->CropPlanes)
   {
     iter->SetEnabled(0);

@@ -124,6 +124,11 @@ public:
   size_t GetNumberOfCropPlanes() { return this->CropPlanes.size(); }
 
   /**
+   * Get the origin and normal for a crop plane.
+   */
+  bool GetCropPlaneParameters(size_t index, double* origin, double* normal);
+
+  /**
    * Get the number of thick crop planes.
    */
   size_t GetNumberOfThickCrops() { return this->ThickCrops.size(); }

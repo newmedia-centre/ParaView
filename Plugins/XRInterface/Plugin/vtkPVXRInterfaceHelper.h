@@ -190,6 +190,8 @@ public:
    * Add/remove crop planes and thick crops
    */
   void AddACropPlane(double* origin, double* normal);
+  void UpdateCropPlaneSlice(std::size_t index, const double* origin, const double* normal);
+  void ClearCropPlaneSliceLinks();
   void collabRemoveAllCropPlanes();
   void collabUpdateCropPlane(int count, double* origin, double* normal);
   void AddAThickCrop(vtkTransform* t);
