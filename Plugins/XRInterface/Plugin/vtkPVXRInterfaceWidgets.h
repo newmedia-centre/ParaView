@@ -24,6 +24,7 @@ class vtkImageData;
 class vtkImplicitPlaneWidget2;
 class vtkOpenGLRenderWindow;
 class vtkPVXRInterfaceHelper;
+class vtkProp;
 struct vtkPVXRInterfaceHelperLocation;
 class vtkStringArray;
 class vtkTransform;
@@ -130,6 +131,11 @@ public:
   bool HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd);
   bool UpdateRemoteCropPlaneInteraction(vtkEventDataDevice3D* edd);
   bool AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D* edd);
+
+  /**
+   * Attach all active crop planes to a newly created or replaced render prop.
+   */
+  void ApplyClippingPlanes(vtkProp* prop);
 
   /**
    * Get the number of thick crop planes.

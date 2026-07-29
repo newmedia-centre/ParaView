@@ -3,6 +3,7 @@
 #include "vtkPVXRInterfaceWidgets.h"
 
 #include "vtk3DWidgetRepresentation.h"
+#include "vtkAbstractMapper3D.h"
 #include "vtkAbstractVolumeMapper.h"
 #include "vtkAssemblyPath.h"
 #include "vtkBoxRepresentation.h"
@@ -28,6 +29,8 @@
 #include "vtkPVRenderView.h"
 #include "vtkPVXRInterfaceCollaborationClient.h"
 #include "vtkPVXRInterfaceHelper.h"
+#include "vtkPlane.h"
+#include "vtkPlaneCollection.h"
 #include "vtkPlaneSource.h"
 #include "vtkPointHandleRepresentation3D.h"
 #include "vtkPolyDataMapper.h"
@@ -780,6 +783,62 @@ bool vtkPVXRInterfaceWidgets::AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D
   }
   this->UpdateRemoteCropPlaneInteraction(edd);
   return true;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceWidgets::ApplyClippingPlanes(vtkProp* prop)
+{
+  if (!prop)
+  {
+    return;
+  }
+
+  prop->InitPathTraversal();
+  for (vtkAssemblyPath* path = prop->GetNextPath(); path; path = prop->GetNextPath())
+  {
+    vtkProp* leaf = path->GetLastNode()->GetViewProp();
+    vtkAbstractMapper3D* mapper = nullptr;
+    if (auto* actor = vtkActor::SafeDownCast(leaf))
+    {
+      mapper = actor->GetMapper();
+    }
+    else if (auto* volume = vtkVolume::SafeDownCast(leaf))
+    {
+      mapper = volume->GetMapper();
+    }
+    if (!mapper)
+    {
+      continue;
+    }
+
+    for (vtkImplicitPlaneWidget2* cropPlane : this->CropPlanes)
+    {
+      auto* representation =
+        vtkImplicitPlaneRepresentation::SafeDownCast(cropPlane->GetRepresentation());
+      vtkPlane* plane = representation ? representation->GetUnderlyingPlane() : nullptr;
+      if (plane &&
+        (!mapper->GetClippingPlanes() || !mapper->GetClippingPlanes()->IsItemPresent(plane)))
+      {
+        mapper->AddClippingPlane(plane);
+      }
+    }
+    for (vtkBoxWidget2* thickCrop : this->ThickCrops)
+    {
+      auto* representation = vtkBoxRepresentation::SafeDownCast(thickCrop->GetRepresentation());
+      if (representation)
+      {
+        for (int planeIndex = 0; planeIndex < 2; ++planeIndex)
+        {
+          vtkPlane* plane = representation->GetUnderlyingPlane(planeIndex);
+          if (plane &&
+            (!mapper->GetClippingPlanes() || !mapper->GetClippingPlanes()->IsItemPresent(plane)))
+          {
+            mapper->AddClippingPlane(plane);
+          }
+        }
+      }
+    }
+  }
 }
 
 //----------------------------------------------------------------------------

@@ -2404,6 +2404,7 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
       if (this->SMView && this->NeedStillRender)
       {
         this->SMView->StillRender();
+        this->UpdateProps();
         this->NeedStillRender = false;
       }
       if (this->SMView && this->Internals->LoadLocationValue >= 0)
@@ -2540,6 +2541,14 @@ void vtkPVXRInterfaceHelper::UpdateProps()
       }
     }
     this->Internals->PropUpdateTime.Modified();
+  }
+
+  vtkCollectionSimpleIterator clippingIterator;
+  vtkProp* clippingProp;
+  for (this->AddedProps->InitTraversal(clippingIterator);
+       (clippingProp = this->AddedProps->GetNextProp(clippingIterator));)
+  {
+    this->Widgets->ApplyClippingPlanes(clippingProp);
   }
 
   this->DoOneEvent();
