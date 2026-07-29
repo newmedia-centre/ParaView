@@ -831,12 +831,15 @@ void vtkPVXRInterfaceHelper::SetRightTriggerMode(int index)
 
   if (auto* vr_rw = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow))
   {
-    vtkVRModel* vrmodel = vr_rw->GetModelForDevice(vtkEventDataDevice::RightController);
-
-    if (vrmodel)
+    const bool showRay =
+      this->Internals->QWidgetWidget->GetEnabled() || this->RightTriggerMode == PICK;
+    for (const auto device :
+      { vtkEventDataDevice::LeftController, vtkEventDataDevice::RightController })
     {
-      vrmodel->SetShowRay(this->Internals->QWidgetWidget->GetEnabled() ||
-        this->RightTriggerMode == vtkPVXRInterfaceHelper::PICK);
+      if (vtkVRModel* vrmodel = vr_rw->GetModelForDevice(device))
+      {
+        vrmodel->SetShowRay(showRay);
+      }
     }
 
     style->GrabWithRayOff();
@@ -902,6 +905,11 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
     (eventID == vtkCommand::ViewerMovement3DEvent ||
       eventID == vtkCommand::Elevation3DEvent))
   {
+    if (this->Widgets->AdjustRemoteCropPlaneDistance(edd))
+    {
+      return true;
+    }
+
     auto* style = this->Internals->Interactor
       ? vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle())
       : nullptr;
@@ -925,6 +933,14 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
     this->Widgets->UpdateNavigationText(edd, this->Internals->RenderWindow);
   }
 
+  if (edd && eventID == vtkCommand::Move3DEvent)
+  {
+    if (this->Widgets->UpdateRemoteCropPlaneInteraction(edd))
+    {
+      return true;
+    }
+  }
+
   // handle right trigger
   if (edd && eventID == vtkCommand::Select3DEvent)
   {
@@ -943,6 +959,12 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
         edd->GetWorldPosition(pos);
         this->AddPointToSource(pos);
       }
+      return true;
+    }
+
+    if (this->RightTriggerMode == vtkPVXRInterfaceHelper::PICK &&
+      this->Widgets->HandleRemoteCropPlaneSelect(edd))
+    {
       return true;
     }
 

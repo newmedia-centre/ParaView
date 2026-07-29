@@ -9,6 +9,7 @@
 #include "vtkBoxWidget2.h"
 #include "vtkCamera.h"
 #include "vtkCellData.h"
+#include "vtkCellPicker.h"
 #include "vtkCompositeDataSet.h"
 #include "vtkDataObjectTreeIterator.h"
 #include "vtkDistanceRepresentation3D.h"
@@ -19,6 +20,7 @@
 #include "vtkImplicitPlaneWidget2.h"
 #include "vtkInformation.h"
 #include "vtkJPEGReader.h"
+#include "vtkMath.h"
 #include "vtkObjectFactory.h"
 #include "vtkOpenGLRenderer.h"
 #include "vtkPVDataRepresentation.h"
@@ -30,6 +32,8 @@
 #include "vtkPointHandleRepresentation3D.h"
 #include "vtkPolyDataMapper.h"
 #include "vtkProperty.h"
+#include "vtkProp.h"
+#include "vtkPropCollection.h"
 #include "vtkQWidgetRepresentation.h"
 #include "vtkQWidgetWidget.h"
 #include "vtkRenderWindowInteractor.h"
@@ -44,6 +48,7 @@
 #include "vtkTextActor3D.h"
 #include "vtkTextProperty.h"
 #include "vtkTexture.h"
+#include "vtkTimerLog.h"
 #include "vtkTransform.h"
 #include "vtkVRFollower.h"
 #include "vtkVRInteractorStyle.h"
@@ -53,9 +58,13 @@
 #include "vtkVector.h"
 #include "vtkView.h"
 #include "vtkVolume.h"
+#include "vtkWidgetEvent.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -114,6 +123,17 @@ vtkPVDataRepresentation* FindRepresentation(vtkProp* prop, vtkView* view)
 //----------------------------------------------------------------------------
 struct vtkPVXRInterfaceWidgets::vtkInternals
 {
+  struct RemoteCropInteraction
+  {
+    bool Active = false;
+    int InteractionState = vtkImplicitPlaneRepresentation::Outside;
+    vtkImplicitPlaneWidget2* Widget = nullptr;
+    double RayDistance = 0.0;
+    double LastDepthEventTime = 0.0;
+    double LastRayPosition[3] = {};
+    double LastWorldOrientation[4] = {};
+  };
+
   vtkNew<vtkVRPanelWidget> NavWidget;
   vtkNew<vtkVRPanelRepresentation> NavRepresentation;
   vtkNew<vtkDistanceWidget> DistanceWidget;
@@ -133,6 +153,7 @@ struct vtkPVXRInterfaceWidgets::vtkInternals
   vtkIdType PreviousPickedCellId = -1;
   std::unique_ptr<vtkImagoLoader> ImagoLoader;
   std::map<vtkSMProxy*, vtkAbstractWidget*> WidgetsFromParaView;
+  std::array<RemoteCropInteraction, vtkEventDataNumberOfDevices> RemoteCropInteractions;
 };
 
 //----------------------------------------------------------------------------
@@ -409,12 +430,371 @@ void vtkPVXRInterfaceWidgets::AddACropPlane(double* origin, double* normal)
 }
 
 //----------------------------------------------------------------------------
+bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd)
+{
+  if (!edd)
+  {
+    return false;
+  }
+
+  const int deviceIndex = static_cast<int>(edd->GetDevice());
+  if (deviceIndex < 0 || deviceIndex >= vtkEventDataNumberOfDevices)
+  {
+    return false;
+  }
+
+  auto& interaction = this->Internals->RemoteCropInteractions[deviceIndex];
+  if (edd->GetAction() == vtkEventDataAction::Release)
+  {
+    if (!interaction.Active)
+    {
+      return false;
+    }
+    this->UpdateRemoteCropPlaneInteraction(edd);
+    vtkImplicitPlaneWidget2* widget = interaction.Widget;
+    auto* representation = widget
+      ? vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation())
+      : nullptr;
+    interaction.Active = false;
+    interaction.LastDepthEventTime = 0.0;
+    if (representation)
+    {
+      representation->SetInteractionState(vtkImplicitPlaneRepresentation::Outside);
+      representation->SetRepresentationState(vtkImplicitPlaneRepresentation::Outside);
+    }
+    if (widget)
+    {
+      widget->InvokeEvent(vtkCommand::EndInteractionEvent, nullptr);
+    }
+    return true;
+  }
+  if (edd->GetAction() != vtkEventDataAction::Press)
+  {
+    return interaction.Active;
+  }
+  interaction = {};
+
+  double rayOrigin[3];
+  double rayDirection[3];
+  edd->GetWorldPosition(rayOrigin);
+  edd->GetWorldDirection(rayDirection);
+  if (vtkMath::Normalize(rayDirection) == 0.0)
+  {
+    return false;
+  }
+
+  // Preserve the widget's native origin and rotation-handle interactions when
+  // the controller is physically touching one of its components.
+  for (vtkImplicitPlaneWidget2* widget : this->CropPlanes)
+  {
+    auto* representation =
+      vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation());
+    if (!representation || !widget->GetEnabled())
+    {
+      continue;
+    }
+
+    representation->SetInteractionState(vtkImplicitPlaneRepresentation::Moving);
+    const int state = representation->ComputeComplexInteractionState(
+      widget->GetInteractor(), widget, vtkWidgetEvent::Select3D, edd);
+    if (state != vtkImplicitPlaneRepresentation::Outside)
+    {
+      return false;
+    }
+  }
+
+  // The native 3D widget picker only tests the controller position. Pick the
+  // visible handles explicitly so the center sphere and frame translate the
+  // plane, while only the front and back cones rotate it.
+  double worldOrientation[4];
+  edd->GetWorldOrientation(worldOrientation);
+  double nearestDistance = std::numeric_limits<double>::max();
+  double nearestRayMiss = std::numeric_limits<double>::max();
+  vtkImplicitPlaneWidget2* nearestWidget = nullptr;
+  int nearestState = vtkImplicitPlaneRepresentation::Outside;
+  for (vtkImplicitPlaneWidget2* widget : this->CropPlanes)
+  {
+    auto* representation =
+      vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation());
+    if (!representation || !widget->GetEnabled())
+    {
+      continue;
+    }
+
+    representation->BuildRepresentation();
+    vtkNew<vtkPropCollection> actors;
+    representation->GetActors(actors);
+    if (actors->GetNumberOfItems() < 7)
+    {
+      continue;
+    }
+
+    const auto considerPick =
+      [&](vtkCellPicker* picker, int interactionState)
+    {
+      if (!picker->Pick3DRay(rayOrigin, worldOrientation, this->Helper->GetRenderer()))
+      {
+        return;
+      }
+
+      double pickPosition[3];
+      picker->GetPickPosition(pickPosition);
+      double pickOffset[3];
+      vtkMath::Subtract(pickPosition, rayOrigin, pickOffset);
+      const double distance = vtkMath::Dot(pickOffset, rayDirection);
+      double closestRayPosition[3] = { rayOrigin[0] + distance * rayDirection[0],
+        rayOrigin[1] + distance * rayDirection[1],
+        rayOrigin[2] + distance * rayDirection[2] };
+      double missOffset[3];
+      vtkMath::Subtract(pickPosition, closestRayPosition, missOffset);
+      const double rayMiss = vtkMath::Norm(missOffset);
+      if (distance > 0.0 &&
+        (rayMiss < nearestRayMiss - 1e-6 ||
+          (std::abs(rayMiss - nearestRayMiss) <= 1e-6 && distance < nearestDistance)))
+      {
+        nearestDistance = distance;
+        nearestRayMiss = rayMiss;
+        nearestWidget = widget;
+        nearestState = interactionState;
+      }
+    };
+
+    // GetActors() exposes outline, plane, frame edges, positive cone, normal
+    // line, negative cone, then the center sphere.
+    vtkNew<vtkCellPicker> framePicker;
+    framePicker->PickFromListOn();
+    framePicker->SetTolerance(0.005);
+    framePicker->AddPickList(vtkProp::SafeDownCast(actors->GetItemAsObject(2)));
+    considerPick(framePicker, vtkImplicitPlaneRepresentation::MovingOutline);
+
+    vtkNew<vtkCellPicker> spherePicker;
+    spherePicker->PickFromListOn();
+    spherePicker->SetTolerance(0.005);
+    spherePicker->AddPickList(vtkProp::SafeDownCast(actors->GetItemAsObject(6)));
+    considerPick(spherePicker, vtkImplicitPlaneRepresentation::MovingOrigin);
+
+    vtkNew<vtkCellPicker> rotationPicker;
+    rotationPicker->PickFromListOn();
+    rotationPicker->SetTolerance(0.005);
+    rotationPicker->AddPickList(vtkProp::SafeDownCast(actors->GetItemAsObject(3)));
+    rotationPicker->AddPickList(vtkProp::SafeDownCast(actors->GetItemAsObject(5)));
+    considerPick(rotationPicker, vtkImplicitPlaneRepresentation::Rotating);
+  }
+
+  if (!nearestWidget)
+  {
+    return false;
+  }
+
+  interaction.Active = true;
+  interaction.InteractionState = nearestState;
+  interaction.Widget = nearestWidget;
+  interaction.RayDistance = nearestDistance;
+  interaction.LastDepthEventTime = vtkTimerLog::GetUniversalTime();
+  for (int i = 0; i < 3; ++i)
+  {
+    interaction.LastRayPosition[i] =
+      rayOrigin[i] + interaction.RayDistance * rayDirection[i];
+  }
+  std::copy(worldOrientation, worldOrientation + 4, interaction.LastWorldOrientation);
+
+  auto* representation =
+    vtkImplicitPlaneRepresentation::SafeDownCast(nearestWidget->GetRepresentation());
+  representation->SetInteractionState(nearestState);
+  representation->SetRepresentationState(nearestState);
+  nearestWidget->InvokeEvent(vtkCommand::StartInteractionEvent, nullptr);
+  return true;
+}
+
+//----------------------------------------------------------------------------
+bool vtkPVXRInterfaceWidgets::UpdateRemoteCropPlaneInteraction(vtkEventDataDevice3D* edd)
+{
+  if (!edd)
+  {
+    return false;
+  }
+
+  const int deviceIndex = static_cast<int>(edd->GetDevice());
+  if (deviceIndex < 0 || deviceIndex >= vtkEventDataNumberOfDevices)
+  {
+    return false;
+  }
+
+  auto& interaction = this->Internals->RemoteCropInteractions[deviceIndex];
+  if (!interaction.Active || !interaction.Widget)
+  {
+    return false;
+  }
+
+  double rayOrigin[3];
+  double rayDirection[3];
+  edd->GetWorldPosition(rayOrigin);
+  edd->GetWorldDirection(rayDirection);
+  if (vtkMath::Normalize(rayDirection) == 0.0)
+  {
+    return false;
+  }
+
+  double projectedPosition[3] = {
+    rayOrigin[0] + interaction.RayDistance * rayDirection[0],
+    rayOrigin[1] + interaction.RayDistance * rayDirection[1],
+    rayOrigin[2] + interaction.RayDistance * rayDirection[2],
+  };
+
+  auto* representation =
+    vtkImplicitPlaneRepresentation::SafeDownCast(interaction.Widget->GetRepresentation());
+  if (!representation)
+  {
+    interaction = {};
+    return false;
+  }
+
+  const bool translating =
+    interaction.InteractionState == vtkImplicitPlaneRepresentation::MovingOrigin ||
+    interaction.InteractionState == vtkImplicitPlaneRepresentation::MovingOutline;
+  if (translating)
+  {
+    double origin[3];
+    representation->GetOrigin(origin);
+    for (int i = 0; i < 3; ++i)
+    {
+      origin[i] += projectedPosition[i] - interaction.LastRayPosition[i];
+      interaction.LastRayPosition[i] = projectedPosition[i];
+    }
+    representation->SetOrigin(origin);
+  }
+
+  if (interaction.InteractionState == vtkImplicitPlaneRepresentation::Rotating)
+  {
+    double worldOrientation[4];
+    edd->GetWorldOrientation(worldOrientation);
+    double inverseLastOrientation[4];
+    std::copy(interaction.LastWorldOrientation, interaction.LastWorldOrientation + 4,
+      inverseLastOrientation);
+    inverseLastOrientation[0] =
+      vtkMath::RadiansFromDegrees(-inverseLastOrientation[0]);
+    double currentOrientation[4];
+    std::copy(worldOrientation, worldOrientation + 4, currentOrientation);
+    currentOrientation[0] = vtkMath::RadiansFromDegrees(currentOrientation[0]);
+
+    double normal[3];
+    double rotatedNormal[3];
+    representation->GetNormal(normal);
+    vtkMath::RotateVectorByWXYZ(normal, inverseLastOrientation, rotatedNormal);
+    vtkMath::RotateVectorByWXYZ(rotatedNormal, currentOrientation, rotatedNormal);
+    representation->SetNormal(rotatedNormal);
+    std::copy(
+      worldOrientation, worldOrientation + 4, interaction.LastWorldOrientation);
+  }
+
+  interaction.Widget->InvokeEvent(vtkCommand::InteractionEvent, nullptr);
+  return true;
+}
+
+//----------------------------------------------------------------------------
+bool vtkPVXRInterfaceWidgets::AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D* edd)
+{
+  if (!edd)
+  {
+    return false;
+  }
+
+  const int deviceIndex = static_cast<int>(edd->GetDevice());
+  if (deviceIndex < 0 || deviceIndex >= vtkEventDataNumberOfDevices)
+  {
+    return false;
+  }
+
+  auto& interaction = this->Internals->RemoteCropInteractions[deviceIndex];
+  if (!interaction.Active)
+  {
+    return false;
+  }
+
+  const double now = vtkTimerLog::GetUniversalTime();
+  if (edd->GetAction() == vtkEventDataAction::Press || interaction.LastDepthEventTime == 0.0)
+  {
+    interaction.LastDepthEventTime = now;
+    return true;
+  }
+  if (edd->GetAction() == vtkEventDataAction::Release)
+  {
+    interaction.LastDepthEventTime = 0.0;
+    return true;
+  }
+
+  if (edd->GetInput() != vtkEventDataDeviceInput::Joystick &&
+    edd->GetInput() != vtkEventDataDeviceInput::TrackPad)
+  {
+    return true;
+  }
+
+  const double elapsed = std::min(0.1, std::max(0.0, now - interaction.LastDepthEventTime));
+  interaction.LastDepthEventTime = now;
+  const auto applyDeadZone = [](double value)
+  {
+    constexpr double axisDeadZone = 0.15;
+    const double magnitude =
+      std::clamp((std::abs(value) - axisDeadZone) / (1.0 - axisDeadZone), 0.0, 1.0);
+    return std::copysign(magnitude, value);
+  };
+  const double* stick = edd->GetTrackPadPosition();
+  const double horizontalAxis = applyDeadZone(stick[0]);
+  const double verticalAxis = applyDeadZone(stick[1]);
+  if ((horizontalAxis == 0.0 && verticalAxis == 0.0) || elapsed == 0.0)
+  {
+    return true;
+  }
+
+  double physicalScale = 1.0;
+  auto* renderWindow =
+    vtkVRRenderWindow::SafeDownCast(this->Helper->GetRenderer()->GetVTKWindow());
+  if (renderWindow)
+  {
+    physicalScale = renderWindow->GetPhysicalScale();
+  }
+  const bool translating =
+    interaction.InteractionState == vtkImplicitPlaneRepresentation::MovingOrigin ||
+    interaction.InteractionState == vtkImplicitPlaneRepresentation::MovingOutline;
+  if (translating)
+  {
+    interaction.RayDistance = std::max(0.05 * physicalScale,
+      interaction.RayDistance + verticalAxis * physicalScale * 1.5 * elapsed);
+  }
+
+  auto* representation = interaction.Widget
+    ? vtkImplicitPlaneRepresentation::SafeDownCast(interaction.Widget->GetRepresentation())
+    : nullptr;
+  if (representation && renderWindow && horizontalAxis != 0.0 &&
+    interaction.InteractionState == vtkImplicitPlaneRepresentation::Rotating)
+  {
+    double normal[3];
+    representation->GetNormal(normal);
+    double* up = renderWindow->GetPhysicalViewUp();
+    double rotation[4] = {
+      vtkMath::RadiansFromDegrees(-horizontalAxis * 90.0 * elapsed), up[0], up[1], up[2]
+    };
+    double rotatedNormal[3];
+    vtkMath::RotateVectorByWXYZ(normal, rotation, rotatedNormal);
+    representation->SetNormal(rotatedNormal);
+  }
+  this->UpdateRemoteCropPlaneInteraction(edd);
+  return true;
+}
+
+//----------------------------------------------------------------------------
 void vtkPVXRInterfaceWidgets::collabAddACropPlane(double* origin, double* normal)
 {
   vtkNew<vtkImplicitPlaneRepresentation> rep;
   rep->SetHandleSize(15.0);
   rep->SetDrawOutline(0);
-  rep->GetPlaneProperty()->SetOpacity(0.01);
+  rep->SetDrawPlane(0);
+  rep->GetPlaneProperty()->SetColor(0.2, 0.85, 1.0);
+  rep->GetPlaneProperty()->SetLineWidth(3.0);
+  rep->GetPlaneProperty()->SetOpacity(0.75);
+  rep->GetPlaneProperty()->SetRepresentationToWireframe();
+  rep->GetSelectedPlaneProperty()->SetLineWidth(4.0);
+  rep->GetSelectedPlaneProperty()->SetRepresentationToWireframe();
   rep->ConstrainToWidgetBoundsOff();
   rep->SetCropPlaneToBoundingBox(false);
   rep->SetSnapToAxes(this->CropSnapping);
@@ -510,6 +890,11 @@ void vtkPVXRInterfaceWidgets::collabAddACropPlane(double* origin, double* normal
 //----------------------------------------------------------------------------
 void vtkPVXRInterfaceWidgets::collabRemoveAllCropPlanes()
 {
+  for (auto& interaction : this->Internals->RemoteCropInteractions)
+  {
+    interaction = {};
+  }
+
   for (vtkImplicitPlaneWidget2* iter : this->CropPlanes)
   {
     iter->SetEnabled(0);

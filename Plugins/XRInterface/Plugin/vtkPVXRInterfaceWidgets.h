@@ -124,6 +124,14 @@ public:
   size_t GetNumberOfCropPlanes() { return this->CropPlanes.size(); }
 
   /**
+   * Project controller events onto crop planes so their full wireframe area
+   * can be selected and manipulated with a distant ray.
+   */
+  bool HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd);
+  bool UpdateRemoteCropPlaneInteraction(vtkEventDataDevice3D* edd);
+  bool AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D* edd);
+
+  /**
    * Get the number of thick crop planes.
    */
   size_t GetNumberOfThickCrops() { return this->ThickCrops.size(); }
