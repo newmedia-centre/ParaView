@@ -65,6 +65,10 @@
       "type": "boolean"
     },
     {
+      "name": "teleportaction",
+      "type": "boolean"
+    },
+    {
       "name": "triggeraction",
       "type": "boolean"
     }
@@ -115,6 +119,7 @@
       "startmovement": "Start Movement",
       "thickcropdirection": "Thick Crop Direction",
       "thickcropstart": "Start Thick Crop Movement",
+      "teleportaction": "Teleport",
       "triggeraction": "Trigger Action",
       "language_tag": "en_US"
     }

@@ -898,6 +898,19 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
   this->Widgets->SetLastEventData(edata);
   vtkEventDataDevice3D* edd = edata->GetAsEventDataDevice3D();
 
+  if (edd &&
+    (eventID == vtkCommand::ViewerMovement3DEvent ||
+      eventID == vtkCommand::Elevation3DEvent))
+  {
+    auto* style = this->Internals->Interactor
+      ? vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle())
+      : nullptr;
+    if (style && style->AdjustGrabbedPropDistance(edd))
+    {
+      return true;
+    }
+  }
+
   if (edd && edd->GetDevice() == vtkEventDataDevice::LeftController &&
     edd->GetAction() == vtkEventDataAction::Press && eventID == vtkCommand::NextPose3DEvent)
   {
@@ -2084,6 +2097,21 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
         }
       });
 
+    oxriren->AddAction("teleportaction",
+      [this](vtkEventData* ed)
+      {
+        vtkEventDataDevice3D* edd = ed->GetAsEventDataDevice3D();
+        auto* style = this->Internals->Interactor
+          ? vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle())
+          : nullptr;
+        if (edd && style && this->Renderer &&
+          edd->GetAction() == vtkEventDataAction::Release)
+        {
+          style->SetCurrentRenderer(this->Renderer);
+          style->Teleportation3D(edd);
+        }
+      });
+
     oxriren->AddAction("thickcropstart",
       [this](vtkEventData* ed)
       {
@@ -2225,6 +2253,10 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
   this->Internals->Interactor->AddObserver(
     vtkCommand::Move3DEvent, this, &vtkPVXRInterfaceHelper::InteractorEventCallback, 2.0);
   this->Internals->Interactor->AddObserver(
+    vtkCommand::ViewerMovement3DEvent, this, &vtkPVXRInterfaceHelper::InteractorEventCallback, 3.0);
+  this->Internals->Interactor->AddObserver(
+    vtkCommand::Elevation3DEvent, this, &vtkPVXRInterfaceHelper::InteractorEventCallback, 3.0);
+  this->Internals->Interactor->AddObserver(
     vtkCommand::NextPose3DEvent, this, &vtkPVXRInterfaceHelper::InteractorEventCallback, 3.0);
 
   // create 4 lights for even lighting
@@ -2278,7 +2310,7 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
     // Set initial values
     this->SetRightTriggerMode(vtkPVXRInterfaceHelper::PICK);
     this->XRInterfaceControls->SetRightTriggerMode(vtkPVXRInterfaceHelper::PICK);
-    this->XRInterfaceControls->SetMovementStyle(vtkVRInteractorStyle::FLY_STYLE);
+    this->XRInterfaceControls->SetMovementStyle(vtkVRInteractorStyle::GROUNDED_STYLE);
     this->XRInterfaceControls->SetCurrentMotionFactor(1);
     this->XRInterfaceControls->SetShowFloor(true);
     this->XRInterfaceControls->SetInteractiveRay(false);

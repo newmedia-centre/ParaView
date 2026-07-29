@@ -29,6 +29,20 @@
               "output": "movement"
             }
           },
+          "path": "/user/hand/left/input/thumbstick"
+        },
+        {
+          "inputs": {
+            "touch": {
+              "output": "startelevation"
+            },
+            "position": {
+              "output": "elevation"
+            },
+            "click": {
+              "output": "teleportaction"
+            }
+          },
           "path": "/user/hand/right/input/thumbstick"
         },
         {
@@ -53,11 +67,35 @@
         },
         {
           "inputs": {
-            "click": {
+            "value": {
               "output": "triggeraction"
             }
           },
-          "path": "/user/hand/right/input/a"
+          "path": "/user/hand/left/input/trigger"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "triggeraction"
+            }
+          },
+          "path": "/user/hand/right/input/trigger"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "complexgestureaction"
+            }
+          },
+          "path": "/user/hand/left/input/squeeze"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "complexgestureaction"
+            }
+          },
+          "path": "/user/hand/right/input/squeeze"
         },
         {
           "inputs": {
