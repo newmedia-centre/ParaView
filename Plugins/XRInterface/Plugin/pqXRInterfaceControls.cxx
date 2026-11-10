@@ -12,6 +12,7 @@
 #include "pqServerManagerModel.h"
 #include "pqSetName.h"
 #include "pqXRCustomViewpointsController.h"
+#include "pqXRInterfaceFilterControls.h"
 #include "vtkPVXRInterfaceHelper.h"
 #include "vtkRenderWindowInteractor.h"
 #include "vtkVRInteractorStyle.h"
@@ -40,6 +41,7 @@ struct pqXRInterfaceControls::pqInternals
   QButtonGroup* ViewUpGroup = nullptr;
   vtkPVXRInterfaceHelper* Helper = nullptr;
   pqCustomViewpointsToolbar* CustomViewpointsToolbar = nullptr;
+  pqXRInterfaceFilterControls* FilterControls = nullptr;
   bool NoForward = false;
 };
 
@@ -74,6 +76,16 @@ pqXRInterfaceControls::pqXRInterfaceControls(vtkPVXRInterfaceHelper* val, QWidge
   this->Internals->Ui.pqXRInterfaceTabs->tabBar()->setExpanding(true);
 
   this->Internals->CustomViewpointsToolbar = toolbar;
+
+  // Clip/slice and iso surface pages acting on the selected source
+  auto* filterControls = new pqXRInterfaceFilterControls(this->Internals->Helper, this);
+  this->Internals->Ui.pqXRInterfaceTabs->addTab(filterControls->clipPage(), tr("Clip"));
+  this->Internals->Ui.pqXRInterfaceTabs->addTab(filterControls->contourPage(), tr("Iso Surface"));
+  QObject::connect(this->Internals->Ui.pipelineBrowser->getSelectionModel(),
+    &QItemSelectionModel::currentChanged, filterControls,
+    [this]()
+    { this->Internals->FilterControls->setSelectedSource(this->GetSelectedPipelineSource()); });
+  this->Internals->FilterControls = filterControls;
 }
 
 //------------------------------------------------------------------------------
@@ -121,6 +133,7 @@ void pqXRInterfaceControls::constructor(vtkPVXRInterfaceHelper* val)
     [&](bool checked) { this->Internals->Helper->SetHoverPick(checked); });
 
   // Fill and connect Right Trigger action combo box
+  this->Internals->Ui.rightTrigger->addItem(tr("Orbit"), QVariant(vtkPVXRInterfaceHelper::ORBIT));
   this->Internals->Ui.rightTrigger->addItem(
     tr("Add Point to Source"), QVariant(vtkPVXRInterfaceHelper::ADD_POINT_TO_SOURCE));
   this->Internals->Ui.rightTrigger->addItem(tr("Grab"), QVariant(vtkPVXRInterfaceHelper::GRAB));
@@ -276,7 +289,8 @@ void pqXRInterfaceControls::resetPositions()
 //------------------------------------------------------------------------------
 void pqXRInterfaceControls::SetRightTriggerMode(vtkPVXRInterfaceHelper::RightTriggerAction action)
 {
-  this->Internals->Ui.rightTrigger->setCurrentIndex(static_cast<int>(action));
+  this->Internals->Ui.rightTrigger->setCurrentIndex(
+    this->Internals->Ui.rightTrigger->findData(QVariant(static_cast<int>(action))));
 }
 
 //------------------------------------------------------------------------------
@@ -360,6 +374,12 @@ void pqXRInterfaceControls::SetSnapCropPlanes(bool checked)
 void pqXRInterfaceControls::SetShowFloor(bool checked)
 {
   this->Internals->Ui.showFloorButton->setChecked(checked);
+}
+
+//------------------------------------------------------------------------------
+void pqXRInterfaceControls::UpdateXRWidgets()
+{
+  this->Internals->FilterControls->setSelectedSource(this->GetSelectedPipelineSource());
 }
 
 //------------------------------------------------------------------------------

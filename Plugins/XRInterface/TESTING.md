@@ -33,15 +33,19 @@ Created with the Valve Index controller, some adaptations may be needed for othe
 
 ## In the XR menu, in “Interaction” tab
 
- - “Right Trigger” combo box:
+ - “Right Trigger” combo box (“Orbit” is the default):
+   - Check “Orbit” action: aim at the data, hold the trigger and sweep the ray (the view orbits around the point aimed at, the data does not move)
+   - While orbiting, push a thumbstick forward/back (moves toward/away from the orbit point)
+   - Release the trigger while aiming at nothing, then orbit again (orbits around the center of the data)
    - Check “Pick” action (pick with the ray)
    - Check “Grab” action (controller must be in actor bounding box)
    - Check “Probe” (pick a cell)
    - Check “Interactive Crop” (keep trigger pressed)
    - Check “Add Point to Source” (will automatically add to the poly line source, make sure it is selected in the pipeline view)
    - Check “Teleportation” (teleport with the ray, make sure that the ray intersect with the prop you want to teleport to)
-   - Back to “Pick” action
- - Outside of the menu, use picking or grabbing to move the wavelet
+   - Back to “Orbit” action
+ - Push the right thumbstick left/right (snap turns 30° around your head)
+ - Outside of the menu, switch to “Pick” or “Grab” and move the wavelet
  - Press “Reset Actors Position“ (actors should come back to their position before picking)
  - Toggle and check “Interactive Ray” (ray should change color upon intersecting an actor)
 
@@ -84,6 +88,25 @@ Created with the Valve Index controller, some adaptations may be needed for othe
  - Grab it and check that it moves with the controller
  - Toggle “Hide Crop Planes” to ensure it hides the thick crop
  - Press “Remove All Crop Planes”
+
+## In the XR menu, in “Clip” tab
+
+ - Select the wavelet in the XR menu pipeline browser
+ - Press “X” (a Clip filter is created and applied without Apply, an orange plane is shown)
+ - Press “Y” and “Z” (the clip normal follows)
+ - Move the “Position”, “Rotate about …” and “Plane Size” sliders (clip and plane update live)
+ - Toggle “Invert”
+ - Drag the orange plane with the ray (the clip follows, sliders restart from the dragged plane)
+ - Press “Align to Surface”, aim at the data and pull the trigger (plane goes through the point, along the surface normal)
+ - Press “Slice” (the Clip is replaced by a Slice with the same plane), press “Slice” again (removed, wavelet visible again)
+ - Toggle “Show Plane” to hide/show the orange plane
+
+## In the XR menu, in “Iso Surface” tab
+
+ - With the wavelet selected, press “Iso Surface” (a Contour filter is created without Apply)
+ - Move the “Value” slider (iso surface updates live), change “Contour By”
+ - Press “Iso Surface” again (contour removed)
+ - Select a source without point arrays (button disabled with a message)
 
 ## In the XR menu:
 

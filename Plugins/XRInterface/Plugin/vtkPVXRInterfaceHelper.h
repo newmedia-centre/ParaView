@@ -30,7 +30,8 @@
 #include "vtkOpenGLRenderer.h" // TODO should not be needed
 #include "vtkVRCamera.h"       // for visibility of enum Pose
 
-#include <array>  // for method sig
+#include <array>      // for method sig
+#include <functional> // for std::function
 #include <map>    // for map
 #include <memory> // for unique_ptr
 #include <vector> // for vector
@@ -38,6 +39,8 @@
 #include <QStringList>
 
 class pqXRInterfaceControls;
+class vtkEventDataDevice3D;
+class vtkMatrix4x4;
 class vtkOpenGLRenderer;
 class vtkPVXMLElement;
 class vtkPVXRInterfaceCollaborationClient;
@@ -83,7 +86,8 @@ public:
     PICK,
     INTERACTIVE_CROP,
     PROBE,
-    TELEPORTATION
+    TELEPORTATION,
+    ORBIT ///< orbit the camera around the point aimed at instead of moving objects
   };
 
   /**
@@ -297,6 +301,20 @@ public:
   void SetHoverPick(bool);
 
   /**
+   * Callback used by RequestSurfacePick(). Position and normal are expressed in
+   * world coordinates.
+   */
+  using SurfacePickCallback =
+    std::function<void(bool hit, const double position[3], const double normal[3])>;
+
+  /**
+   * Use the next trigger press that does not target the XR menu to pick a
+   * surface along the controller ray, then call the callback with the result.
+   * Passing an empty callback cancels a pending request.
+   */
+  void RequestSurfacePick(SurfacePickCallback callback);
+
+  /**
    * Set custom value chosen in the XR menu on the selected cell and given array.
    */
   void SetEditableFieldValue(std::string name);
@@ -416,6 +434,40 @@ protected:
 
   void LoadNextCameraPose();
 
+  ///@{
+  /**
+   * Camera orbit around the point aimed at with the controller ray. The
+   * physical to world transform is rotated around that pivot so the data never
+   * moves, the viewer moves around it.
+   */
+  bool StartOrbit(vtkEventDataDevice3D* edd);
+  void UpdateOrbit(vtkEventDataDevice3D* edd);
+  void EndOrbit();
+  ///@}
+
+  /**
+   * Rotate the viewer around the vertical axis through the headset when the
+   * right thumbstick is pushed sideways.
+   */
+  void HandleSnapTurn(vtkEventDataDevice3D* edd);
+
+  /**
+   * Set the physical to world transform while keeping the XR menu panel at the
+   * same place relative to the user.
+   */
+  void SetPhysicalToWorldMatrix(vtkMatrix4x4* matrix);
+
+  /**
+   * Pick the visible data along the controller ray. Results are in world
+   * coordinates. Returns false when nothing is hit.
+   */
+  bool PickAlongRay(vtkEventDataDevice3D* edd, double position[3], double normal[3]);
+
+  /**
+   * Center of the bounds of the visible data props, in world coordinates.
+   */
+  bool GetVisibleDataCenter(double center[3]);
+
   void DoOneEvent();
   void RenderXRView();
 
@@ -435,7 +487,7 @@ private:
   bool UseOpenXR = false;
   bool UseOpenXRRemoting = false;
   std::string RemotingAddress = "127.0.0.1";
-  RightTriggerAction RightTriggerMode = vtkPVXRInterfaceHelper::PICK;
+  RightTriggerAction RightTriggerMode = vtkPVXRInterfaceHelper::ORBIT;
 
   vtkSMViewProxy* SMView = nullptr;
   pqXRInterfaceControls* XRInterfaceControls = nullptr;

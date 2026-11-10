@@ -52,6 +52,8 @@ set(sources
   pqXRInterfaceControls.h
   pqXRInterfaceDockPanel.cxx
   pqXRInterfaceDockPanel.h
+  pqXRInterfaceFilterControls.cxx
+  pqXRInterfaceFilterControls.h
   pqXRCustomViewpointsController.h
   pqXRCustomViewpointsController.cxx
   vtkXRInterfacePolyfill.cxx

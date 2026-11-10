@@ -79,6 +79,12 @@ public:
    */
   void UpdateCustomViewpointsToolbar();
 
+  /**
+   * Re-create the XR widgets owned by the menu pages (clip plane). Called when
+   * entering XR.
+   */
+  void UpdateXRWidgets();
+
 protected Q_SLOTS:
   void resetCamera();
   void resetPositions();

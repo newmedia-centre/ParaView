@@ -32,13 +32,18 @@
 #include "pqPipelineSource.h"
 #include "pqServerManagerModel.h"
 #include "pqXRInterfaceControls.h"
+#include "vtkBoundingBox.h"
 #include "vtkCallbackCommand.h"
+#include "vtkCellPicker.h"
 #include "vtkCullerCollection.h"
+#include "vtkEventData.h"
 #include "vtkGenericOpenGLRenderWindow.h"
 #include "vtkImplicitPlaneRepresentation.h"
 #include "vtkInformation.h"
 #include "vtkLight.h"
 #include "vtkLightCollection.h"
+#include "vtkMath.h"
+#include "vtkMatrix4x4.h"
 #include "vtkMatrixToLinearTransform.h"
 #include "vtkObjectFactory.h"
 #include "vtkOpenGLFramebufferObject.h"
@@ -53,6 +58,7 @@
 #include "vtkPVXRInterfacePluginLocation.h"
 #include "vtkPVXRInterfaceWidgets.h"
 #include "vtkPlaneSource.h"
+#include "vtkPropCollection.h"
 #include "vtkQWidgetRepresentation.h"
 #include "vtkQWidgetTexture.h"
 #include "vtkQWidgetWidget.h"
@@ -85,7 +91,9 @@
 #include "vtksys/SystemTools.hxx"
 #include <QCoreApplication>
 #include <QModelIndex>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <sstream>
 #include <thread>
 
@@ -148,7 +156,79 @@ struct vtkPVXRInterfaceHelper::vtkInternals
   // To simulate dpad with a trackpad on OpenXR we need to
   // store the last position
   double LeftTrackPadPosition[2] = { 0., 0. };
+
+  // Camera orbit state. Everything is anchored at the moment the orbit starts
+  // (or the last dolly step) so rotations never accumulate rounding errors.
+  struct OrbitState
+  {
+    bool Active = false;
+    vtkEventDataDevice Device = vtkEventDataDevice::Unknown;
+    double PhysicalPivot[3] = { 0.0, 0.0, 0.0 };
+    double BaseDirection[3] = { 0.0, 0.0, -1.0 }; // controller ray, physical coordinates
+    double PitchAxis[3] = { 1.0, 0.0, 0.0 };      // physical coordinates
+    vtkNew<vtkMatrix4x4> BaseMatrix;               // physical to world at anchor time
+    double StickY = 0.0;
+    double LastUpdateTime = 0.0;
+  };
+  OrbitState Orbit;
+
+  // Snap turn must return to center before turning again
+  bool SnapTurnLatched[vtkEventDataNumberOfDevices] = {};
+
+  vtkPVXRInterfaceHelper::SurfacePickCallback PendingSurfacePick;
 };
+
+namespace
+{
+// Physical coordinates are meters in the tracking space, +Y is up.
+constexpr double PhysicalUp[3] = { 0.0, 1.0, 0.0 };
+// Orbit rotation applied for one radian of controller ray rotation.
+constexpr double OrbitGain = 2.0;
+// Fraction of the distance to the pivot covered per second at full stick.
+constexpr double OrbitDollySpeed = 1.5;
+// Closest distance to the pivot reachable with dolly, in meters.
+constexpr double OrbitMinimumDistance = 0.1;
+constexpr double SnapTurnAngle = 30.0;
+
+double ApplyDeadZone(double value)
+{
+  constexpr double deadZone = 0.15;
+  const double magnitude = std::clamp((std::abs(value) - deadZone) / (1.0 - deadZone), 0.0, 1.0);
+  return std::copysign(magnitude, value);
+}
+
+void TransformToPhysical(vtkMatrix4x4* physicalToWorld, const double world[3], double w,
+  double physical[3])
+{
+  vtkNew<vtkMatrix4x4> worldToPhysical;
+  vtkMatrix4x4::Invert(physicalToWorld, worldToPhysical);
+  const double in[4] = { world[0], world[1], world[2], w };
+  double out[4];
+  worldToPhysical->MultiplyPoint(in, out);
+  std::copy(out, out + 3, physical);
+}
+
+bool GetHeadPhysicalPosition(vtkVRRenderWindow* renderWindow, double position[3])
+{
+  vtkMatrix4x4* pose =
+    renderWindow->GetDeviceToPhysicalMatrixForDevice(vtkEventDataDevice::HeadMountedDisplay);
+  if (!pose)
+  {
+    return false;
+  }
+  for (int i = 0; i < 3; ++i)
+  {
+    position[i] = pose->GetElement(i, 3);
+  }
+  return true;
+}
+
+bool IsThumbstick(vtkEventDataDevice3D* edd)
+{
+  return edd->GetInput() == vtkEventDataDeviceInput::Joystick ||
+    edd->GetInput() == vtkEventDataDeviceInput::TrackPad;
+}
+}
 
 //----------------------------------------------------------------------------
 vtkStandardNewMacro(vtkPVXRInterfaceHelper);
@@ -818,6 +898,7 @@ void vtkPVXRInterfaceHelper::SetRightTriggerMode(int index)
   this->HideBillboard();
   this->CollaborationClient->HideBillboard();
   this->RightTriggerMode = static_cast<vtkPVXRInterfaceHelper::RightTriggerAction>(index);
+  this->EndOrbit();
 
   auto style = this->Internals->Interactor
     ? vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle())
@@ -831,8 +912,8 @@ void vtkPVXRInterfaceHelper::SetRightTriggerMode(int index)
 
   if (auto* vr_rw = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow))
   {
-    const bool showRay =
-      this->Internals->QWidgetWidget->GetEnabled() || this->RightTriggerMode == PICK;
+    const bool showRay = this->Internals->QWidgetWidget->GetEnabled() ||
+      this->RightTriggerMode == PICK || this->RightTriggerMode == ORBIT;
     for (const auto device :
       { vtkEventDataDevice::LeftController, vtkEventDataDevice::RightController })
     {
@@ -873,6 +954,13 @@ void vtkPVXRInterfaceHelper::SetRightTriggerMode(int index)
         style->MapInputToAction(vtkCommand::Select3DEvent, VTKIS_TELEPORTATION);
         style->GrabWithRayOn();
         break;
+      case vtkPVXRInterfaceHelper::ORBIT:
+        // The trigger is handled in InteractorEventCallback, the style only
+        // draws the ray.
+        this->SetShowRightControllerMarker(false);
+        style->MapInputToAction(vtkCommand::Select3DEvent, VTKIS_NONE);
+        style->GrabWithRayOn();
+        break;
       default:
         break;
     }
@@ -900,22 +988,35 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
   vtkEventData* edata = static_cast<vtkEventData*>(calldata);
   this->Widgets->SetLastEventData(edata);
   vtkEventDataDevice3D* edd = edata->GetAsEventDataDevice3D();
+  auto& orbit = this->Internals->Orbit;
 
   if (edd &&
-    (eventID == vtkCommand::ViewerMovement3DEvent ||
-      eventID == vtkCommand::Elevation3DEvent))
+    (eventID == vtkCommand::ViewerMovement3DEvent || eventID == vtkCommand::Elevation3DEvent))
   {
     if (this->Widgets->AdjustRemoteCropPlaneDistance(edd))
     {
       return true;
     }
 
-    auto* style = this->Internals->Interactor
-      ? vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle())
-      : nullptr;
-    if (style && style->AdjustGrabbedPropDistance(edd))
+    // While orbiting, pushing either thumbstick forward or back moves the
+    // viewer toward or away from the pivot instead of walking.
+    if (orbit.Active)
     {
+      if (edd->GetAction() == vtkEventDataAction::Release)
+      {
+        orbit.StickY = 0.0;
+      }
+      else if (edd->GetAction() != vtkEventDataAction::Press && IsThumbstick(edd))
+      {
+        // Press comes from touching the stick and carries no position
+        orbit.StickY = ApplyDeadZone(edd->GetTrackPadPosition()[1]);
+      }
       return true;
+    }
+
+    if (eventID == vtkCommand::Elevation3DEvent)
+    {
+      this->HandleSnapTurn(edd);
     }
   }
 
@@ -939,15 +1040,63 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
     {
       return true;
     }
+
+    if (orbit.Active && edd->GetDevice() == orbit.Device)
+    {
+      // Do not consume the event so the interactor style keeps the rays updated
+      this->UpdateOrbit(edd);
+    }
   }
 
-  // handle right trigger
+  // handle triggers
   if (edd && eventID == vtkCommand::Select3DEvent)
   {
-    // always pass events on to QWidget if enabled
+    // Always finish a ray drag of a plane widget, whatever else is going on
+    if (edd->GetAction() == vtkEventDataAction::Release &&
+      this->Widgets->HandleRemoteCropPlaneSelect(edd))
+    {
+      return true;
+    }
+
+    if (orbit.Active)
+    {
+      if (edd->GetDevice() == orbit.Device && edd->GetAction() == vtkEventDataAction::Release)
+      {
+        this->EndOrbit();
+      }
+      return true;
+    }
+
+    // Pass events on to the XR menu when it is aimed at (the menu only listens
+    // to the right controller). Other trigger modes keep the historical
+    // behavior of ignoring the scene while the menu is open.
     if (this->Internals->QWidgetWidget->GetEnabled())
     {
-      return false;
+      auto* panel = this->Internals->QWidgetWidget->GetQWidgetRepresentation();
+      const bool panelAimedAt = edd->GetDevice() == vtkEventDataDevice::RightController &&
+        panel && panel->GetInteractionState() != vtkQWidgetRepresentation::Outside;
+      if (panelAimedAt ||
+        (this->RightTriggerMode != vtkPVXRInterfaceHelper::ORBIT &&
+          !this->Internals->PendingSurfacePick))
+      {
+        return false;
+      }
+    }
+
+    // A surface pick was requested from the XR menu
+    if (this->Internals->PendingSurfacePick)
+    {
+      if (edd->GetAction() == vtkEventDataAction::Press)
+      {
+        auto callback = std::move(this->Internals->PendingSurfacePick);
+        this->Internals->PendingSurfacePick = nullptr;
+
+        double position[3] = { 0.0, 0.0, 0.0 };
+        double normal[3] = { 0.0, 0.0, 1.0 };
+        const bool hit = this->PickAlongRay(edd, position, normal);
+        callback(hit, position, normal);
+      }
+      return true;
     }
 
     // in add point mode, then do that
@@ -962,9 +1111,22 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
       return true;
     }
 
-    if (this->RightTriggerMode == vtkPVXRInterfaceHelper::PICK &&
-      this->Widgets->HandleRemoteCropPlaneSelect(edd))
+    // Crop planes can be dragged from a distance with the ray
+    bool touchingWidget = false;
+    if ((this->RightTriggerMode == vtkPVXRInterfaceHelper::PICK ||
+          this->RightTriggerMode == vtkPVXRInterfaceHelper::ORBIT) &&
+      this->Widgets->HandleRemoteCropPlaneSelect(edd, &touchingWidget))
     {
+      return true;
+    }
+
+    // Start orbiting, unless the controller physically touches a plane
+    // widget which then handles the trigger itself. Releases without an
+    // active orbit are passed on so such widgets see the end of the drag.
+    if (this->RightTriggerMode == vtkPVXRInterfaceHelper::ORBIT && !touchingWidget &&
+      edd->GetAction() == vtkEventDataAction::Press)
+    {
+      this->StartOrbit(edd);
       return true;
     }
 
@@ -972,6 +1134,358 @@ bool vtkPVXRInterfaceHelper::InteractorEventCallback(
   }
 
   return false;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::RequestSurfacePick(SurfacePickCallback callback)
+{
+  this->Internals->PendingSurfacePick = std::move(callback);
+}
+
+//----------------------------------------------------------------------------
+bool vtkPVXRInterfaceHelper::PickAlongRay(
+  vtkEventDataDevice3D* edd, double position[3], double normal[3])
+{
+  if (!this->Renderer || !edd)
+  {
+    return false;
+  }
+
+  // Only pick the ParaView data, not the widgets, floor or menu
+  vtkNew<vtkCellPicker> picker;
+  picker->PickFromListOn();
+  picker->SetTolerance(0.001);
+  bool hasCandidates = false;
+  vtkCollectionSimpleIterator pit;
+  vtkProp* prop;
+  for (this->AddedProps->InitTraversal(pit); (prop = this->AddedProps->GetNextProp(pit));)
+  {
+    if (prop->GetVisibility() && prop->GetPickable())
+    {
+      picker->AddPickList(prop);
+      hasCandidates = true;
+    }
+  }
+  if (!hasCandidates)
+  {
+    return false;
+  }
+
+  double origin[3];
+  double orientation[4];
+  edd->GetWorldPosition(origin);
+  edd->GetWorldOrientation(orientation);
+  if (!picker->Pick3DRay(origin, orientation, this->Renderer))
+  {
+    return false;
+  }
+
+  picker->GetPickPosition(position);
+  picker->GetPickNormal(normal);
+  return true;
+}
+
+//----------------------------------------------------------------------------
+bool vtkPVXRInterfaceHelper::GetVisibleDataCenter(double center[3])
+{
+  vtkBoundingBox bbox;
+  vtkCollectionSimpleIterator pit;
+  vtkProp* prop;
+  for (this->AddedProps->InitTraversal(pit); (prop = this->AddedProps->GetNextProp(pit));)
+  {
+    const double* bounds =
+      prop->GetVisibility() && prop->GetUseBounds() ? prop->GetBounds() : nullptr;
+    if (bounds && vtkBoundingBox::IsValid(bounds))
+    {
+      bbox.AddBounds(bounds);
+    }
+  }
+  if (!bbox.IsValid())
+  {
+    return false;
+  }
+  bbox.GetCenter(center);
+  return true;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::SetPhysicalToWorldMatrix(vtkMatrix4x4* matrix)
+{
+  auto* renderWindow = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow);
+  if (!renderWindow || !matrix)
+  {
+    return;
+  }
+
+  // Keep the menu panel where it is relative to the user
+  vtkNew<vtkMatrix4x4> previous;
+  renderWindow->GetPhysicalToWorldMatrix(previous);
+  vtkPlaneSource* panel = this->Internals->QWidgetWidget->GetEnabled()
+    ? this->Internals->QWidgetWidget->GetQWidgetRepresentation()->GetPlaneSource()
+    : nullptr;
+  double panelPoints[3][3];
+  if (panel)
+  {
+    TransformToPhysical(previous, panel->GetOrigin(), 1.0, panelPoints[0]);
+    TransformToPhysical(previous, panel->GetPoint1(), 1.0, panelPoints[1]);
+    TransformToPhysical(previous, panel->GetPoint2(), 1.0, panelPoints[2]);
+  }
+
+  // vtkRenderWindow::SetPhysicalToWorldMatrix ignores changes smaller than
+  // 1e-3 which makes slow orbits stutter, so set the members directly.
+  double xAxis[3];
+  double yAxis[3];
+  double zAxis[3];
+  for (int row = 0; row < 3; ++row)
+  {
+    xAxis[row] = matrix->GetElement(row, 0);
+    yAxis[row] = matrix->GetElement(row, 1);
+    zAxis[row] = matrix->GetElement(row, 2);
+  }
+  const double scale = vtkMath::Norm(xAxis);
+  if (scale <= 0.0 || vtkMath::Normalize(yAxis) == 0.0 || vtkMath::Normalize(zAxis) == 0.0)
+  {
+    return;
+  }
+  renderWindow->SetPhysicalViewUp(yAxis);
+  renderWindow->SetPhysicalViewDirection(-zAxis[0], -zAxis[1], -zAxis[2]);
+  renderWindow->SetPhysicalTranslation(
+    -matrix->GetElement(0, 3), -matrix->GetElement(1, 3), -matrix->GetElement(2, 3));
+  renderWindow->SetPhysicalScale(scale);
+
+  if (panel)
+  {
+    double point[4];
+    const auto toWorld = [&](const double physical[3])
+    {
+      const double in[4] = { physical[0], physical[1], physical[2], 1.0 };
+      matrix->MultiplyPoint(in, point);
+      return point;
+    };
+    panel->SetOrigin(toWorld(panelPoints[0]));
+    panel->SetPoint1(toWorld(panelPoints[1]));
+    panel->SetPoint2(toWorld(panelPoints[2]));
+  }
+
+  if (this->Renderer)
+  {
+    this->Renderer->ResetCameraClippingRange();
+  }
+}
+
+//----------------------------------------------------------------------------
+bool vtkPVXRInterfaceHelper::StartOrbit(vtkEventDataDevice3D* edd)
+{
+  auto* renderWindow = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow);
+  if (!renderWindow || !edd)
+  {
+    return false;
+  }
+
+  // Orbit around the surface point aimed at, or around the data center when
+  // the ray misses everything.
+  double pivot[3];
+  double normal[3];
+  if (!this->PickAlongRay(edd, pivot, normal) && !this->GetVisibleDataCenter(pivot))
+  {
+    return false;
+  }
+
+  auto& orbit = this->Internals->Orbit;
+  renderWindow->GetPhysicalToWorldMatrix(orbit.BaseMatrix);
+
+  double worldDirection[3];
+  edd->GetWorldDirection(worldDirection);
+  TransformToPhysical(orbit.BaseMatrix, worldDirection, 0.0, orbit.BaseDirection);
+  if (vtkMath::Normalize(orbit.BaseDirection) == 0.0)
+  {
+    return false;
+  }
+  TransformToPhysical(orbit.BaseMatrix, pivot, 1.0, orbit.PhysicalPivot);
+
+  // Pitch around the horizontal axis perpendicular to the line of sight
+  double head[3] = { 0.0, 0.0, 0.0 };
+  GetHeadPhysicalPosition(renderWindow, head);
+  double toPivot[3];
+  vtkMath::Subtract(orbit.PhysicalPivot, head, toPivot);
+  toPivot[1] = 0.0;
+  if (vtkMath::Normalize(toPivot) < 1e-6)
+  {
+    std::copy(orbit.BaseDirection, orbit.BaseDirection + 3, toPivot);
+    toPivot[1] = 0.0;
+    if (vtkMath::Normalize(toPivot) < 1e-6)
+    {
+      toPivot[0] = 0.0;
+      toPivot[2] = -1.0;
+    }
+  }
+  vtkMath::Cross(toPivot, PhysicalUp, orbit.PitchAxis);
+  vtkMath::Normalize(orbit.PitchAxis);
+
+  // Thumbsticks dolly while orbiting: stop any walking in progress, its end
+  // event would be swallowed and the viewer would keep drifting.
+  if (auto* style =
+        vtkVRInteractorStyle::SafeDownCast(this->Internals->Interactor->GetInteractorStyle()))
+  {
+    for (const auto device :
+      { vtkEventDataDevice::LeftController, vtkEventDataDevice::RightController })
+    {
+      const int state = style->GetInteractionState(device);
+      if (state == VTKIS_DOLLY || state == VTKIS_GROUNDMOVEMENT || state == VTKIS_ELEVATION)
+      {
+        style->SetInteractionState(device, VTKIS_NONE);
+      }
+    }
+  }
+
+  orbit.Active = true;
+  orbit.Device = edd->GetDevice();
+  orbit.StickY = 0.0;
+  orbit.LastUpdateTime = vtkTimerLog::GetUniversalTime();
+  return true;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::UpdateOrbit(vtkEventDataDevice3D* edd)
+{
+  auto* renderWindow = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow);
+  auto& orbit = this->Internals->Orbit;
+  if (!renderWindow || !orbit.Active)
+  {
+    return;
+  }
+
+  const double now = vtkTimerLog::GetUniversalTime();
+  const double elapsed = std::clamp(now - orbit.LastUpdateTime, 0.0, 0.1);
+  orbit.LastUpdateTime = now;
+
+  // Controller ray in physical coordinates. The event was computed with the
+  // current physical to world matrix.
+  vtkNew<vtkMatrix4x4> current;
+  renderWindow->GetPhysicalToWorldMatrix(current);
+  double worldDirection[3];
+  edd->GetWorldDirection(worldDirection);
+  double direction[3];
+  TransformToPhysical(current, worldDirection, 0.0, direction);
+  if (vtkMath::Normalize(direction) == 0.0)
+  {
+    return;
+  }
+
+  // Sweeping the ray left/right turns the data around the vertical axis and
+  // up/down tilts it, as if the ray dragged the surface it points at.
+  double base[3] = { orbit.BaseDirection[0], 0.0, orbit.BaseDirection[2] };
+  double now2D[3] = { direction[0], 0.0, direction[2] };
+  double yaw = 0.0;
+  if (vtkMath::Normalize(base) > 1e-6 && vtkMath::Normalize(now2D) > 1e-6)
+  {
+    yaw = std::atan2(base[2] * now2D[0] - base[0] * now2D[2], vtkMath::Dot(base, now2D));
+  }
+  const double pitch = std::asin(std::clamp(direction[1], -1.0, 1.0)) -
+    std::asin(std::clamp(orbit.BaseDirection[1], -1.0, 1.0));
+
+  // Moving the viewer by the inverse rotation around the pivot, in physical
+  // coordinates: M = Base * T(pivot) * R_yaw * R_pitch * T(-pivot)
+  vtkNew<vtkTransform> viewerMotion;
+  viewerMotion->Translate(orbit.PhysicalPivot);
+  viewerMotion->RotateWXYZ(vtkMath::DegreesFromRadians(OrbitGain * yaw), PhysicalUp[0],
+    PhysicalUp[1], PhysicalUp[2]);
+  viewerMotion->RotateWXYZ(vtkMath::DegreesFromRadians(OrbitGain * pitch), orbit.PitchAxis);
+  viewerMotion->Translate(
+    -orbit.PhysicalPivot[0], -orbit.PhysicalPivot[1], -orbit.PhysicalPivot[2]);
+
+  vtkNew<vtkMatrix4x4> result;
+  vtkMatrix4x4::Multiply4x4(orbit.BaseMatrix, viewerMotion->GetMatrix(), result);
+
+  // Thumbstick dolly toward/away from the pivot, proportional to the distance
+  // so it works at any scale.
+  double head[3];
+  if (orbit.StickY != 0.0 && elapsed > 0.0 && GetHeadPhysicalPosition(renderWindow, head))
+  {
+    double toPivot[3];
+    vtkMath::Subtract(orbit.PhysicalPivot, head, toPivot);
+    const double distance = vtkMath::Normalize(toPivot);
+    if (distance > 1e-6)
+    {
+      double step = orbit.StickY * distance * OrbitDollySpeed * elapsed;
+      if (step > 0.0)
+      {
+        step = std::min(step, std::max(0.0, distance - OrbitMinimumDistance));
+      }
+
+      vtkNew<vtkTransform> dolly;
+      dolly->Translate(step * toPivot[0], step * toPivot[1], step * toPivot[2]);
+      vtkMatrix4x4::Multiply4x4(result, dolly->GetMatrix(), result);
+
+      // Re-anchor so the following rotations start from the new position
+      for (int i = 0; i < 3; ++i)
+      {
+        orbit.PhysicalPivot[i] -= step * toPivot[i];
+      }
+      orbit.BaseMatrix->DeepCopy(result);
+      std::copy(direction, direction + 3, orbit.BaseDirection);
+    }
+  }
+
+  this->SetPhysicalToWorldMatrix(result);
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::EndOrbit()
+{
+  auto& orbit = this->Internals->Orbit;
+  orbit.Active = false;
+  orbit.Device = vtkEventDataDevice::Unknown;
+  orbit.StickY = 0.0;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceHelper::HandleSnapTurn(vtkEventDataDevice3D* edd)
+{
+  auto* renderWindow = vtkVRRenderWindow::SafeDownCast(this->Internals->RenderWindow);
+  const int deviceIndex = static_cast<int>(edd->GetDevice());
+  if (!renderWindow || deviceIndex < 0 || deviceIndex >= vtkEventDataNumberOfDevices)
+  {
+    return;
+  }
+
+  bool& latched = this->Internals->SnapTurnLatched[deviceIndex];
+  if (edd->GetAction() == vtkEventDataAction::Release)
+  {
+    latched = false;
+    return;
+  }
+  if (edd->GetAction() == vtkEventDataAction::Press || !IsThumbstick(edd))
+  {
+    // Press comes from touching the stick and carries no position
+    return;
+  }
+
+  const double* stick = edd->GetTrackPadPosition();
+  if (std::abs(stick[0]) < 0.25)
+  {
+    latched = false;
+    return;
+  }
+  if (latched || std::abs(stick[0]) < 0.7 || std::abs(stick[0]) < std::abs(stick[1]))
+  {
+    return;
+  }
+  latched = true;
+
+  // Rotate the viewer around the vertical axis through the headset
+  double head[3] = { 0.0, 0.0, 0.0 };
+  GetHeadPhysicalPosition(renderWindow, head);
+  vtkNew<vtkTransform> turn;
+  turn->Translate(head[0], 0.0, head[2]);
+  turn->RotateY(stick[0] > 0.0 ? -SnapTurnAngle : SnapTurnAngle);
+  turn->Translate(-head[0], 0.0, -head[2]);
+
+  vtkNew<vtkMatrix4x4> current;
+  renderWindow->GetPhysicalToWorldMatrix(current);
+  vtkNew<vtkMatrix4x4> result;
+  vtkMatrix4x4::Multiply4x4(current, turn->GetMatrix(), result);
+  this->SetPhysicalToWorldMatrix(result);
 }
 
 //----------------------------------------------------------------------------
@@ -2330,14 +2844,15 @@ void vtkPVXRInterfaceHelper::SendToXR(vtkSMViewProxy* smview)
   if (vrRenWin && vrRenWin->GetVRInitialized())
   {
     // Set initial values
-    this->SetRightTriggerMode(vtkPVXRInterfaceHelper::PICK);
-    this->XRInterfaceControls->SetRightTriggerMode(vtkPVXRInterfaceHelper::PICK);
+    this->SetRightTriggerMode(vtkPVXRInterfaceHelper::ORBIT);
+    this->XRInterfaceControls->SetRightTriggerMode(vtkPVXRInterfaceHelper::ORBIT);
     this->XRInterfaceControls->SetMovementStyle(vtkVRInteractorStyle::GROUNDED_STYLE);
     this->XRInterfaceControls->SetCurrentMotionFactor(1);
     this->XRInterfaceControls->SetShowFloor(true);
     this->XRInterfaceControls->SetInteractiveRay(false);
     this->XRInterfaceControls->SetNavigationPanel(false);
     this->XRInterfaceControls->SetSnapCropPlanes(false);
+    this->XRInterfaceControls->UpdateXRWidgets();
 
     // Ensure that the floor actor is displayed in case the checkbox
     // "Show Floor" stays checked between sessions

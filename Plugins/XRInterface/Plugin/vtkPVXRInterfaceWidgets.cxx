@@ -157,6 +157,10 @@ struct vtkPVXRInterfaceWidgets::vtkInternals
   std::unique_ptr<vtkImagoLoader> ImagoLoader;
   std::map<vtkSMProxy*, vtkAbstractWidget*> WidgetsFromParaView;
   std::array<RemoteCropInteraction, vtkEventDataNumberOfDevices> RemoteCropInteractions;
+
+  vtkSmartPointer<vtkImplicitPlaneWidget2> SectionPlane;
+  double SectionPlaneSize = 0.0;
+  vtkPVXRInterfaceWidgets::SectionPlaneCallback SectionPlaneChanged;
 };
 
 //----------------------------------------------------------------------------
@@ -433,8 +437,14 @@ void vtkPVXRInterfaceWidgets::AddACropPlane(double* origin, double* normal)
 }
 
 //----------------------------------------------------------------------------
-bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd)
+bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(
+  vtkEventDataDevice3D* edd, bool* touchingWidget)
 {
+  if (touchingWidget)
+  {
+    *touchingWidget = false;
+  }
+
   if (!edd)
   {
     return false;
@@ -476,6 +486,7 @@ bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* 
     return interaction.Active;
   }
   interaction = {};
+  const std::vector<vtkImplicitPlaneWidget2*> planes = this->GetRayDraggablePlanes();
 
   double rayOrigin[3];
   double rayDirection[3];
@@ -488,7 +499,7 @@ bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* 
 
   // Preserve the widget's native origin and rotation-handle interactions when
   // the controller is physically touching one of its components.
-  for (vtkImplicitPlaneWidget2* widget : this->CropPlanes)
+  for (vtkImplicitPlaneWidget2* widget : planes)
   {
     auto* representation =
       vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation());
@@ -502,6 +513,10 @@ bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* 
       widget->GetInteractor(), widget, vtkWidgetEvent::Select3D, edd);
     if (state != vtkImplicitPlaneRepresentation::Outside)
     {
+      if (touchingWidget)
+      {
+        *touchingWidget = true;
+      }
       return false;
     }
   }
@@ -515,7 +530,7 @@ bool vtkPVXRInterfaceWidgets::HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* 
   double nearestRayMiss = std::numeric_limits<double>::max();
   vtkImplicitPlaneWidget2* nearestWidget = nullptr;
   int nearestState = vtkImplicitPlaneRepresentation::Outside;
-  for (vtkImplicitPlaneWidget2* widget : this->CropPlanes)
+  for (vtkImplicitPlaneWidget2* widget : planes)
   {
     auto* representation =
       vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation());
@@ -783,6 +798,104 @@ bool vtkPVXRInterfaceWidgets::AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D
   }
   this->UpdateRemoteCropPlaneInteraction(edd);
   return true;
+}
+
+//----------------------------------------------------------------------------
+std::vector<vtkImplicitPlaneWidget2*> vtkPVXRInterfaceWidgets::GetRayDraggablePlanes()
+{
+  std::vector<vtkImplicitPlaneWidget2*> planes = this->CropPlanes;
+  if (this->Internals->SectionPlane && this->Internals->SectionPlane->GetEnabled())
+  {
+    planes.push_back(this->Internals->SectionPlane);
+  }
+  return planes;
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceWidgets::SetSectionPlaneCallback(SectionPlaneCallback callback)
+{
+  this->Internals->SectionPlaneChanged = std::move(callback);
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceWidgets::ShowSectionPlane(
+  const double origin[3], const double normal[3], double size)
+{
+  vtkRenderer* ren = this->Helper ? this->Helper->GetRenderer() : nullptr;
+  auto* renWin = ren ? vtkOpenGLRenderWindow::SafeDownCast(ren->GetVTKWindow()) : nullptr;
+  if (!renWin || !renWin->GetInteractor() || size <= 0.0)
+  {
+    return;
+  }
+
+  auto& widget = this->Internals->SectionPlane;
+  if (!widget)
+  {
+    // Same look as crop planes, in orange to tell them apart
+    vtkNew<vtkImplicitPlaneRepresentation> rep;
+    rep->SetHandleSize(15.0);
+    rep->SetDrawOutline(0);
+    rep->SetDrawPlane(0);
+    rep->GetPlaneProperty()->SetColor(1.0, 0.6, 0.1);
+    rep->GetPlaneProperty()->SetLineWidth(3.0);
+    rep->GetPlaneProperty()->SetOpacity(0.75);
+    rep->GetPlaneProperty()->SetRepresentationToWireframe();
+    rep->GetSelectedPlaneProperty()->SetLineWidth(4.0);
+    rep->GetSelectedPlaneProperty()->SetRepresentationToWireframe();
+    rep->ConstrainToWidgetBoundsOff();
+    rep->SetCropPlaneToBoundingBox(false);
+    rep->SetPlaceFactor(1.0);
+
+    widget = vtkSmartPointer<vtkImplicitPlaneWidget2>::New();
+    widget->SetRepresentation(rep);
+
+    widget->AddObserver(
+      vtkCommand::InteractionEvent, this, &vtkPVXRInterfaceWidgets::SectionPlaneEvent);
+    widget->AddObserver(
+      vtkCommand::EndInteractionEvent, this, &vtkPVXRInterfaceWidgets::SectionPlaneEvent);
+  }
+
+  auto* rep = vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation());
+  if (size != this->Internals->SectionPlaneSize)
+  {
+    // The plane edge is the diagonal of the placement box
+    const double half = 0.5 * size / std::sqrt(3.0);
+    double bounds[6] = { origin[0] - half, origin[0] + half, origin[1] - half, origin[1] + half,
+      origin[2] - half, origin[2] + half };
+    rep->PlaceWidget(bounds);
+    this->Internals->SectionPlaneSize = size;
+  }
+  rep->SetOrigin(const_cast<double*>(origin));
+  rep->SetNormal(const_cast<double*>(normal));
+
+  if (!widget->GetEnabled())
+  {
+    widget->SetInteractor(renWin->GetInteractor());
+    widget->SetCurrentRenderer(ren);
+    widget->SetEnabled(1);
+  }
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceWidgets::SectionPlaneEvent(vtkObject*, unsigned long event, void*)
+{
+  vtkImplicitPlaneWidget2* widget = this->Internals->SectionPlane;
+  auto* rep =
+    widget ? vtkImplicitPlaneRepresentation::SafeDownCast(widget->GetRepresentation()) : nullptr;
+  if (rep && this->Internals->SectionPlaneChanged)
+  {
+    this->Internals->SectionPlaneChanged(
+      rep->GetOrigin(), rep->GetNormal(), event == vtkCommand::EndInteractionEvent);
+  }
+}
+
+//----------------------------------------------------------------------------
+void vtkPVXRInterfaceWidgets::HideSectionPlane()
+{
+  if (this->Internals->SectionPlane)
+  {
+    this->Internals->SectionPlane->SetEnabled(0);
+  }
 }
 
 //----------------------------------------------------------------------------
@@ -2112,6 +2225,14 @@ void vtkPVXRInterfaceWidgets::HandlePickEvent(vtkObject*, void* calldata)
 //----------------------------------------------------------------------------
 void vtkPVXRInterfaceWidgets::Quit()
 {
+  // the section plane widget is bound to the XR interactor which goes away
+  if (this->Internals->SectionPlane)
+  {
+    this->Internals->SectionPlane->SetEnabled(0);
+    this->Internals->SectionPlane = nullptr;
+    this->Internals->SectionPlaneSize = 0.0;
+  }
+
   // remove any widgets that are no longer in ParaView
   for (auto it = this->Internals->WidgetsFromParaView.begin();
        it != this->Internals->WidgetsFromParaView.end();)

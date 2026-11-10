@@ -13,7 +13,8 @@
 #include "vtkObject.h"
 #include "vtkSmartPointer.h" // for ivars
 
-#include <future> // for ivar
+#include <functional> // for std::function
+#include <future>     // for ivar
 #include <vector> // for ivar
 
 class vtkBoxWidget2;
@@ -128,7 +129,7 @@ public:
    * Project controller events onto crop planes so their full wireframe area
    * can be selected and manipulated with a distant ray.
    */
-  bool HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd);
+  bool HandleRemoteCropPlaneSelect(vtkEventDataDevice3D* edd, bool* touchingWidget = nullptr);
   bool UpdateRemoteCropPlaneInteraction(vtkEventDataDevice3D* edd);
   bool AdjustRemoteCropPlaneDistance(vtkEventDataDevice3D* edd);
 
@@ -136,6 +137,21 @@ public:
    * Attach all active crop planes to a newly created or replaced render prop.
    */
   void ApplyClippingPlanes(vtkProp* prop);
+
+  ///@{
+  /**
+   * Plane widget showing the plane of the clip or slice filter driven from the
+   * XR menu. It can be dragged with the controller ray like crop planes.
+   * `size` is the edge length of the displayed plane, in world units.
+   * The callback is invoked while the plane is dragged in XR, with `finished`
+   * set once the drag ends.
+   */
+  using SectionPlaneCallback =
+    std::function<void(const double origin[3], const double normal[3], bool finished)>;
+  void ShowSectionPlane(const double origin[3], const double normal[3], double size);
+  void HideSectionPlane();
+  void SetSectionPlaneCallback(SectionPlaneCallback callback);
+  ///@}
 
   /**
    * Get the number of thick crop planes.
@@ -224,6 +240,13 @@ protected:
   bool IsCellImageDifferent(std::string const& oldimg, std::string const& newimg);
   bool EventCallback(vtkObject* object, unsigned long event, void* calldata);
   void UpdateTexture();
+
+  /**
+   * Plane widgets that can be dragged with the controller ray.
+   */
+  std::vector<vtkImplicitPlaneWidget2*> GetRayDraggablePlanes();
+
+  void SectionPlaneEvent(vtkObject* caller, unsigned long event, void* calldata);
 
 private:
   vtkPVXRInterfaceWidgets(const vtkPVXRInterfaceWidgets&) = delete;
